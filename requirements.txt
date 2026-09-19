@@ -1,0 +1,6 @@
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+pyarrow>=15
+pygame-ce>=2.5
+chess>=1.10

@@ -1,0 +1,435 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<title>Connectome Fly</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+:root{
+  --ink:#151312; --ink-2:#4a433d; --paper:#f3efe7; --panel:#ffffff;
+  --line:#ddd5c7; --amber:#c8761a; --neuron:#1f7a6f; --quiet:#b9b0a1;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ink:#f1ece3; --ink-2:#a79d8e; --paper:#131211; --panel:#1c1a18;
+    --line:#312d29; --amber:#e89a3c; --neuron:#4fd0be; --quiet:#5a534a;
+  }
+}
+:root[data-theme="dark"]{
+  --ink:#f1ece3; --ink-2:#a79d8e; --paper:#131211; --panel:#1c1a18;
+  --line:#312d29; --amber:#e89a3c; --neuron:#4fd0be; --quiet:#5a534a;
+}
+*{box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:Archivo,system-ui,sans-serif;margin:0}
+.wrap{max-width:1080px;margin:0 auto;padding:0 16px;padding-block:28px 40px}
+h1{font-size:clamp(26px,4vw,40px);line-height:1.05;margin:0 0 6px;text-wrap:balance;letter-spacing:-.02em}
+.sub{color:var(--ink-2);max-width:62ch;margin:0 0 20px;font-size:15px;line-height:1.5}
+.eyebrow{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:11px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--amber);margin:0 0 10px}
+.stage{position:relative;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--panel)}
+canvas{display:block;width:100%;height:clamp(300px,52vh,520px);touch-action:none;cursor:grab}
+canvas:active{cursor:grabbing}
+.hud{position:absolute;left:12px;top:12px;font-family:"IBM Plex Mono",monospace;font-size:11px;
+  line-height:1.7;color:var(--ink-2);background:color-mix(in srgb,var(--panel) 82%,transparent);
+  padding:8px 10px;border:1px solid var(--line);border-radius:4px;font-variant-numeric:tabular-nums}
+.hud b{color:var(--ink);font-weight:500}
+.bar{height:4px;width:110px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:3px}
+.bar i{display:block;height:100%;width:0;background:var(--amber);transition:width .08s linear}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}
+button{font:500 14px Archivo,sans-serif;padding:9px 16px;border-radius:4px;border:1px solid var(--line);
+  background:var(--panel);color:var(--ink);cursor:pointer}
+button.primary{background:var(--amber);border-color:var(--amber);color:#1b1206}
+button:focus-visible{outline:2px solid var(--neuron);outline-offset:2px}
+label.slide{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink-2);
+  font-family:"IBM Plex Mono",monospace}
+input[type=range]{accent-color:var(--amber);width:130px}
+.keys{display:flex;gap:4px}
+.keys button{width:38px;padding:9px 0;font-family:"IBM Plex Mono",monospace}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-top:26px}
+.note{border-top:2px solid var(--line);padding-top:10px}
+.note h3{font-size:13px;margin:0 0 4px;letter-spacing:.01em}
+.note p{margin:0;font-size:13px;line-height:1.5;color:var(--ink-2)}
+.note b{color:var(--amber);font-weight:700}
+footer{margin-top:26px;font-size:12px;color:var(--quiet);font-family:"IBM Plex Mono",monospace}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head><body>
+<div class="wrap">
+  <p class="eyebrow">MaleCNS · garden arena</p>
+  <h1>Connectome Fly</h1>
+  <p class="sub">A fly loose in a garden. It runs itself: Hunger builds, its antennae smell the sugar around it, and it
+  turns toward whichever side smells stronger until the taste neurons fire and feeding takes over.
+  Switch autopilot off and <b>W A S D</b> gives you the legs back — until it finds food, which it
+  still refuses to walk away from. Stones and stems are in the way — it feels them and turns.</p>
+
+  <div class="stage">
+    <canvas id="c"></canvas>
+    <div class="hud">
+      t <b id="t">0.00</b> s<br>
+      spikes/10 ms <b id="sp">0</b><br>
+      mode <b id="mode">exploring</b><br>
+      hunger <b id="hun">0</b>%<br>
+      odour L <b id="ol">0.0</b> · R <b id="or">0.0</b><br>
+      drops eaten <b id="ate">0</b> / <b id="tot">6</b><br>
+      feeding drive <b id="fd">0</b>%
+      <div class="bar"><i id="bar"></i></div>
+      <div id="lock" hidden style="color:var(--amber);margin-top:4px">feeding — legs locked</div>
+      <div id="err" hidden style="color:#c0392b;margin-top:6px;max-width:220px;white-space:pre-wrap"></div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="sugar">Drop sugar ahead</button>
+    <button id="reset">Reset</button>
+    <button id="auto">Autopilot: on</button>
+    <span class="keys" id="pad">
+      <button data-k="w" aria-label="walk forward">W</button>
+      <button data-k="a" aria-label="turn left">A</button>
+      <button data-k="s" aria-label="walk back">S</button>
+      <button data-k="d" aria-label="turn right">D</button>
+    </span>
+    <label class="slide">stimulation
+      <input type="range" id="rate" min="20" max="250" value="150" step="10">
+      <span id="ratev">150 Hz</span></label>
+    <label class="slide">speed
+      <input type="range" id="speed" min="10" max="100" value="35" step="5">
+      <span id="speedv">0.35×</span></label>
+  </div>
+
+  <div class="grid">
+    <div class="note"><h3>Drives</h3><p>Hunger climbs with time and drops when the fly feeds. Nothing
+    here is a plan — the behaviour falls out of a few competing signals.</p></div>
+    <div class="note"><h3>Antennae</h3><p>Two odour sensors, a few millimetres apart. Steering toward
+    the stronger side is <b>klinotaxis</b> — how real insects track a smell. Berries smell strongest.</p></div>
+    <div class="note"><h3>Obstacles</h3><p>Stones, stems and the fence are solid. A bump triggers a
+    short turn-and-back reflex before the fly resumes whatever it was doing.</p></div>
+  </div>
+
+  <footer>Leaky integrate-and-fire neurons, tripod CPG, two-sensor klinotaxis, bump reflex, 0.01 s bins.
+  Autonomous, not conscious — it has drives and reflexes, no inner life.</footer>
+</div>
+
+<script>
+(function(){
+const cv=document.getElementById('c');
+const renderer=new THREE.WebGLRenderer({canvas:cv,antialias:true});
+const scene=new THREE.Scene();
+const camera=new THREE.PerspectiveCamera(42,2,0.1,200);
+function themeBG(){return getComputedStyle(document.documentElement).getPropertyValue('--panel').trim()||'#fff';}
+const cam={az:0.9,el:0.36,r:15,tx:0};
+const SKY=new THREE.Color(0xcfe6f2);
+function resize(){const w=cv.clientWidth,h=cv.clientHeight;renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+  renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix();}
+new ResizeObserver(resize).observe(cv);
+
+scene.add(new THREE.HemisphereLight(0xbfe4ff,0x4a5a25,0.95));
+const key=new THREE.DirectionalLight(0xfff3d6,1.25);key.position.set(9,14,5);scene.add(key);
+scene.fog=new THREE.Fog(0xcfe6f2,42,86);
+
+// ---- garden floor ----
+const SOIL=new THREE.MeshStandardMaterial({color:0x6c8a3a,roughness:1});
+const ground=new THREE.Mesh(new THREE.CircleGeometry(34,64),SOIL);
+ground.rotation.x=-Math.PI/2;scene.add(ground);
+const dirt=new THREE.MeshStandardMaterial({color:0x5a4630,roughness:1});
+for(let i=0;i<14;i++){const a=Math.random()*6.28,r=Math.random()*28;
+  const m=new THREE.Mesh(new THREE.CircleGeometry(1+Math.random()*2.5,12),dirt);
+  m.rotation.x=-Math.PI/2;m.position.set(Math.cos(a)*r,0.02,Math.sin(a)*r);scene.add(m);}
+
+// ---- grass ----
+const GRASS=new THREE.MeshStandardMaterial({color:0x4f7a2a,roughness:.9,side:THREE.DoubleSide});
+const blade=new THREE.ConeGeometry(.16,2.4,4);
+const grassMesh=new THREE.InstancedMesh(blade,GRASS,900);
+const tmp=new THREE.Object3D();
+for(let i=0;i<900;i++){
+  const a=Math.random()*6.28,r=3+Math.sqrt(Math.random())*30;
+  tmp.position.set(Math.cos(a)*r,1.1,Math.sin(a)*r);
+  tmp.rotation.set((Math.random()-.5)*.35,Math.random()*6.28,(Math.random()-.5)*.35);
+  tmp.scale.setScalar(.6+Math.random()*.9);
+  tmp.updateMatrix();grassMesh.setMatrixAt(i,tmp.matrix);
+}
+scene.add(grassMesh);
+
+// ---- obstacles: stones, stems, fence ----
+const OBST=[];
+const STONE=new THREE.MeshStandardMaterial({color:0x9b978d,roughness:.95});
+const STEM =new THREE.MeshStandardMaterial({color:0x5d7a33,roughness:.85});
+function obstacle(mesh,x,z,r){mesh.position.set(x,mesh.position.y,z);scene.add(mesh);
+  OBST.push({x:x,z:z,r:r});}
+for(let i=0;i<9;i++){
+  const a=Math.random()*6.28,d=7+Math.random()*18;
+  const s=1.4+Math.random()*1.8;
+  const m=new THREE.Mesh(new THREE.DodecahedronGeometry(s,0),STONE);
+  m.position.y=s*.55;m.rotation.set(Math.random(),Math.random(),Math.random());
+  obstacle(m,Math.cos(a)*d,Math.sin(a)*d,s*1.1);
+}
+for(let i=0;i<7;i++){
+  const a=Math.random()*6.28,d=6+Math.random()*20;
+  const h=7+Math.random()*6;
+  const m=new THREE.Mesh(new THREE.CylinderGeometry(.35,.5,h,8),STEM);
+  m.position.y=h/2;
+  obstacle(m,Math.cos(a)*d,Math.sin(a)*d,1.1);
+  const leaf=new THREE.Mesh(new THREE.SphereGeometry(1.6,12,8),STEM);
+  leaf.scale.set(1,.35,1.6);leaf.position.set(Math.cos(a)*d,h,Math.sin(a)*d);scene.add(leaf);
+}
+const FENCE=new THREE.MeshStandardMaterial({color:0x8a6a3e,roughness:.9});
+for(let i=0;i<40;i++){const a=i/40*6.28;
+  const m=new THREE.Mesh(new THREE.BoxGeometry(.7,5,.7),FENCE);
+  m.position.set(Math.cos(a)*31,2.5,Math.sin(a)*31);m.rotation.y=a;scene.add(m);}
+
+// ---- fly body ----
+const GOLD=new THREE.MeshStandardMaterial({color:0xb9812f,roughness:.55,metalness:.05});
+const DARK=new THREE.MeshStandardMaterial({color:0x6d4a1c,roughness:.6});
+const EYE =new THREE.MeshStandardMaterial({color:0x8e1f14,roughness:.35});
+const WING=new THREE.MeshStandardMaterial({color:0xe9f2f6,transparent:true,opacity:.34,side:THREE.DoubleSide});
+const fly=new THREE.Group();scene.add(fly);
+function ell(rx,ry,rz,mat,x,y,z){const m=new THREE.Mesh(new THREE.SphereGeometry(1,24,18),mat);
+  m.scale.set(rx,ry,rz);m.position.set(x,y,z);fly.add(m);return m;}
+ell(2.3,1.25,1.25,GOLD,2.0,1.5,0);            // abdomen
+ell(1.25,1.15,1.15,GOLD,-.5,1.7,0);           // thorax
+const head=ell(.85,.85,.85,GOLD,-1.9,1.8,0);
+ell(.45,.55,.42,EYE,-2.3,1.95,.5);ell(.45,.55,.42,EYE,-2.3,1.95,-.5);
+const prob=new THREE.Mesh(new THREE.CylinderGeometry(.12,.16,1,10),DARK);
+prob.position.set(-2.3,1.1,0);fly.add(prob);
+for(const s of[1,-1]){const w=new THREE.Mesh(new THREE.PlaneGeometry(3.4,1.1),WING);
+  w.position.set(1.1,2.5,s*.5);w.rotation.set(Math.PI/2,0,s*0.22);fly.add(w);}
+
+// ---- legs: 3 per side, 2 segments each ----
+const legs=[];
+const HIP=[[-1.0,.9],[-.2,.55],[.6,.2]];   // [x, z-offset scale]
+for(let i=0;i<3;i++)for(const s of[1,-1]){
+  const root=new THREE.Group();root.position.set(HIP[i][0],1.25,s*0.95);fly.add(root);
+  const up=new THREE.Mesh(new THREE.CylinderGeometry(.09,.08,1.5,8),DARK);
+  up.position.y=-.75;const upG=new THREE.Group();upG.add(up);root.add(upG);
+  const lowG=new THREE.Group();lowG.position.y=-1.5;upG.add(lowG);
+  const low=new THREE.Mesh(new THREE.CylinderGeometry(.07,.05,1.6,8),DARK);
+  low.position.y=-.8;lowG.add(low);
+  legs.push({up:upG,low:lowG,side:s,i:i,phase:((i+(s>0?0:1))%2)*Math.PI});
+}
+
+// ---- brain: neuron cloud above the fly ----
+const N=420,SUG=21;
+const pts=new Float32Array(N*3),col=new Float32Array(N*3);
+for(let i=0;i<N;i++){
+  let x,y,z;
+  if(i<SUG){x=-2.4+(Math.random()-.5)*.7;y=5.4+(Math.random()-.5)*.4;z=(Math.random()-.5)*.7;}
+  else{const a=Math.random()*Math.PI*2,r=Math.sqrt(Math.random())*2.6;
+       x=r*Math.cos(a)*1.25;y=6.7+ (Math.random()-.5)*1.5;z=r*Math.sin(a)*.8;}
+  pts.set([x,y,z],i*3);
+}
+const g=new THREE.BufferGeometry();
+g.setAttribute('position',new THREE.BufferAttribute(pts,3));
+g.setAttribute('color',new THREE.BufferAttribute(col,3));
+const cloud=new THREE.Points(g,new THREE.PointsMaterial({size:.17,vertexColors:true,sizeAttenuation:true}));
+fly.add(cloud);
+
+// ---- neural state: LIF-ish network ----
+const v=new Float32Array(N),glow=new Float32Array(N);
+const w=new Float32Array(N);for(let i=SUG;i<N;i++)w[i]=0.25+Math.random()*0.9; // how strongly each is driven
+let stim=0, tSim=0, drive=0, spikes=0, gait=0, amps=1;
+let heading=0, fwd=0, turn=0, eaten=0, turnBias=0;
+let hunger=0.35, auto=true, manualUntil=0, wander=0, mode='exploring';
+let bump=0, bumpDir=1;
+const keys={};
+const SUGAR_R=1.6, DROPS=[];
+const dropMat=new THREE.MeshStandardMaterial({color:0xa4213a,roughness:.35,
+  emissive:0x3a0a12,emissiveIntensity:.3});
+function addDrop(x,z){
+  const m=new THREE.Mesh(new THREE.SphereGeometry(1.0,18,14),dropMat);
+  m.position.set(x,.85,z);m.scale.set(1,.85,1);scene.add(m);DROPS.push(m);return m;
+}
+function scatter(n){
+  for(const d of DROPS) scene.remove(d);
+  DROPS.length=0;eaten=0;
+  let tries=0;
+  while(DROPS.length<n && tries++<400){
+    const a=Math.random()*Math.PI*2,r=6+Math.random()*20;
+    const x=Math.cos(a)*r,z=Math.sin(a)*r;
+    if(OBST.some(o=>Math.hypot(o.x-x,o.z-z)<o.r+2.5)) continue;
+    addDrop(x,z);
+  }
+}
+const $t=document.getElementById('t'),$sp=document.getElementById('sp'),
+      $fd=document.getElementById('fd'),$bar=document.getElementById('bar'),
+      $ate=document.getElementById('ate'),$lock=document.getElementById('lock'),
+      $mode=document.getElementById('mode'),$hun=document.getElementById('hun'),
+      $ol=document.getElementById('ol'),$orr=document.getElementById('or'),
+      $auto=document.getElementById('auto');
+$auto.onclick=()=>{auto=!auto;$auto.textContent='Autopilot: '+(auto?'on':'off');};
+
+let rate=150, speed=.35;
+const $rv=document.getElementById('ratev'),$sv=document.getElementById('speedv');
+document.getElementById('rate').oninput=e=>{rate=+e.target.value;$rv.textContent=rate+' Hz';};
+document.getElementById('speed').oninput=e=>{speed=e.target.value/100;$sv.textContent=speed.toFixed(2)+'×';};
+document.getElementById('sugar').onclick=()=>{
+  addDrop(fly.position.x+Math.cos(heading)*4, fly.position.z-Math.sin(heading)*4);
+  document.getElementById('tot').textContent=DROPS.length+eaten;};
+document.getElementById('reset').onclick=()=>{
+  stim=0;drive=0;tSim=0;hunger=0.35;v.fill(0);glow.fill(0);
+  fly.position.set(0,0,0);heading=0;scatter(6);
+  document.getElementById('tot').textContent=DROPS.length;};
+addEventListener('keydown',e=>{const k=e.key.toLowerCase();
+  if('wasd'.includes(k)||k.startsWith('arrow')){keys[k]=1;e.preventDefault();}});
+addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=0;});
+for(const b of document.querySelectorAll('#pad button')){
+  const k=b.dataset.k;
+  const on=e=>{e.preventDefault();keys[k]=1;}, off=()=>keys[k]=0;
+  b.addEventListener('pointerdown',on);b.addEventListener('pointerup',off);
+  b.addEventListener('pointerleave',off);b.addEventListener('pointercancel',off);}
+
+function stepBrain(dt){
+  spikes=0;
+  const pIn=stim*rate*dt;
+  for(let i=0;i<N;i++){
+    const input=i<SUG ? (Math.random()<pIn?1.6:0)
+                      : (Math.random()<pIn*w[i]*0.55?1.3:0) + (drive*w[i]*dt*9);
+    v[i]+= -v[i]*dt/0.02 + input;
+    if(v[i]>1){v[i]=0;glow[i]=1;spikes++;}
+    glow[i]*=0.86;
+  }
+  const dsp=spikes/(N-SUG);
+  drive += (Math.min(1,dsp*2.4)-drive)*Math.min(1,dt*6);
+}
+
+function paint(){
+  const c=g.attributes.color.array;
+  for(let i=0;i<N;i++){
+    const base=i<SUG?[.78,.46,.10]:[.12,.48,.44];
+    const k=glow[i];
+    c[i*3]  =base[0]+k*(1-base[0]);
+    c[i*3+1]=base[1]+k*(.95-base[1]);
+    c[i*3+2]=base[2]+k*(.75-base[2]);
+  }
+  g.attributes.color.needsUpdate=true;
+}
+
+let last=performance.now();
+function fail(e){const b=document.getElementById('err');b.hidden=false;
+  b.textContent='error: '+(e&&e.message?e.message:e);console.error(e);}
+function frame(now){ try{ frameBody(now); }catch(e){ fail(e); return; } requestAnimationFrame(frame); }
+function frameBody(now){
+  const real=Math.min((now-last)/1000,.05);last=now;
+  const dt=real*speed;
+  for(let k=0;k<4;k++) stepBrain(dt/4);
+  tSim+=dt;
+
+  // ---- senses: two antennae smelling every drop ----
+  const ant=(sx)=>{
+    const ax=fly.position.x+Math.cos(heading)*-2.6-Math.sin(heading)*sx*0.9;
+    const az=fly.position.z-Math.sin(heading)*-2.6-Math.cos(heading)*sx*0.9;
+    let c=0; for(const d of DROPS) c+=d.scale.x*3/(1+Math.hypot(d.position.x-ax,d.position.z-az));
+    return c;
+  };
+  const oL=ant(1), oR=ant(-1), odour=(oL+oR)/2;
+
+  // ---- drives ----
+  hunger = Math.min(1, hunger + dt*0.035 - drive*dt*0.5);
+  hunger = Math.max(0, hunger);
+
+  // ---- your commands ----
+  const K=k=>keys[k]?1:0;
+  let wantF=K('w')+K('arrowup')-K('s')-K('arrowdown');
+  let wantT=K('a')+K('arrowleft')-K('d')-K('arrowright');
+  if(wantF||wantT) manualUntil=tSim+1.2;
+
+  // ---- bump reflex beats everything except feeding ----
+  bump=Math.max(0,bump-dt);
+
+  // ---- or the fly's own decision ----
+  const manual=tSim<manualUntil;
+  if(bump>0 && drive<0.15){ wantT=bumpDir; wantF=-0.35; mode='avoiding'; }
+  else if(auto && !manual){
+    if(drive>0.15){ wantF=0; wantT=0; mode='feeding'; }
+    else if(hunger<0.25){ wantF=0; wantT=0; mode='resting'; }
+    else if(odour>0.28){                       // smells food: climb the gradient
+      wantT=Math.max(-1,Math.min(1,(oL-oR)*14));
+      wantF=0.55+0.45*Math.min(1,hunger);
+      mode='tracking odour';
+    } else {                                   // nothing nearby: wander
+      wander+=dt;
+      if(wander>1.1+Math.random()){wander=0;turnBias=(Math.random()*2-1);}
+      wantT=turnBias; wantF=0.45+hunger*0.4;
+      mode='exploring';
+      const edge=Math.hypot(fly.position.x,fly.position.z);
+      if(edge>20){ const home=Math.atan2(-fly.position.z,-fly.position.x);
+        let e=((home-heading+Math.PI*3)%(Math.PI*2))-Math.PI; wantT=Math.max(-1,Math.min(1,e*2)); }
+    }
+  } else if(manual||!auto){ mode = drive>0.15?'feeding':'manual'; }
+  const freedom=1-drive;                       // feeding overrides steering
+  fwd  += (wantF*freedom-fwd)*Math.min(1,dt*7);
+  turn += (wantT*freedom-turn)*Math.min(1,dt*7);
+  heading += turn*dt*2.4;
+
+  const effort=Math.min(1,Math.abs(fwd)+Math.abs(turn)*0.6);
+  amps += ((1-drive)*effort-amps)*Math.min(1,dt*6);
+  gait += dt*12*Math.max(amps,0)*Math.PI;
+  for(const L of legs){
+    const p=gait+L.phase;
+    const side=1+L.side*turn*0.5;              // outer legs sweep wider in a turn
+    L.up.rotation.z = amps*0.5*side*Math.sin(p);
+    L.up.rotation.x = L.side*amps*0.22*Math.cos(p);
+    L.low.rotation.z= -amps*0.6*Math.max(0,Math.sin(p+1.2))-0.5;
+  }
+  const step=dt*7*amps*Math.sign(fwd||1)*Math.min(1,Math.abs(fwd)+0.001);
+  fly.position.x += Math.cos(heading)*step;
+  fly.position.z -= Math.sin(heading)*step;
+  // stones, stems and fence are solid
+  for(const o of OBST){
+    const dx=fly.position.x-o.x, dz=fly.position.z-o.z, d=Math.hypot(dx,dz), min=o.r+1.8;
+    if(d<min && d>0.001){
+      fly.position.x=o.x+dx/d*min; fly.position.z=o.z+dz/d*min;
+      if(bump<=0){ bump=0.7; bumpDir=(Math.random()<.5?-1:1); }
+    }
+  }
+  const R=Math.hypot(fly.position.x,fly.position.z);
+  if(R>29){ fly.position.x*=29/R; fly.position.z*=29/R;
+            if(bump<=0){ bump=0.9; bumpDir=(Math.random()<.5?-1:1); } }
+  fly.rotation.y = heading;
+
+  // ---- taste: standing on a drop stimulates the sugar neurons ----
+  let onSugar=0;
+  const mx=fly.position.x+Math.cos(heading)*-2.2, mz=fly.position.z-Math.sin(heading)*-2.2;
+  for(let i=DROPS.length-1;i>=0;i--){
+    const d=DROPS[i];
+    if(Math.hypot(d.position.x-mx,d.position.z-mz)<SUGAR_R){
+      onSugar=1;
+      d.scale.multiplyScalar(1-dt*0.55*drive);
+      if(d.scale.x<0.18){scene.remove(d);DROPS.splice(i,1);eaten++;}
+    }
+  }
+  stim=onSugar*(0.25+0.75*hunger);   // a full fly barely responds to sugar
+  prob.scale.y=1+drive*2.2; prob.position.y=1.1-drive*0.55;
+  head.rotation.z=drive*0.25;
+
+  paint();
+  $t.textContent=tSim.toFixed(2);
+  $sp.textContent=spikes;
+  $fd.textContent=Math.round(drive*100);
+  $ate.textContent=eaten;
+  $mode.textContent=mode;
+  $hun.textContent=Math.round(hunger*100);
+  $ol.textContent=oL.toFixed(1);$orr.textContent=oR.toFixed(1);
+  if(auto && DROPS.length===0 && eaten>0) scatter(6);
+  $lock.hidden = drive<0.45;
+  $bar.style.width=(drive*100).toFixed(0)+'%';
+
+  const tgt=new THREE.Vector3(fly.position.x,3.2,fly.position.z);
+  camera.position.set(tgt.x+cam.r*Math.cos(cam.el)*Math.sin(cam.az),
+                      3.2+cam.r*Math.sin(cam.el),
+                      tgt.z+cam.r*Math.cos(cam.el)*Math.cos(cam.az));
+  camera.lookAt(tgt);
+  scene.background=SKY; scene.fog.color=SKY;
+  renderer.render(scene,camera);
+}
+
+// orbit
+let drag=null;
+cv.addEventListener('pointerdown',e=>{drag={x:e.clientX,y:e.clientY};cv.setPointerCapture(e.pointerId);});
+cv.addEventListener('pointermove',e=>{if(!drag)return;
+  cam.az-=(e.clientX-drag.x)*.008; cam.el=Math.max(-.2,Math.min(1.2,cam.el+(e.clientY-drag.y)*.006));
+  drag={x:e.clientX,y:e.clientY};});
+cv.addEventListener('pointerup',()=>drag=null);
+cv.addEventListener('wheel',e=>{e.preventDefault();cam.r=Math.max(6,Math.min(34,cam.r+e.deltaY*.02));},{passive:false});
+
+try{ scatter(6); resize(); paint(); }catch(e){ fail(e); }
+frame(performance.now());
+})();
+</script>
+</body></html>
