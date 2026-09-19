@@ -114,3 +114,72 @@ than on whether the move is any good. The panel shows how many *distinct*
 descending responses it found across the legal moves; when that is 1 the fly
 cannot tell them apart and the interface says so instead of pretending. You
 should win comfortably.
+
+## Fly-brain shader for Ghostty
+
+A custom [Ghostty](https://ghostty.org) shader that draws a glowing slice of the
+real connectome behind your terminal text. Tested against Ghostty 1.3.1 on macOS (Metal).
+
+```
+ghostty/bake.py                 runs the LIF sim, picks neurons/edges, writes flybrain.glsl
+ghostty/flybrain.template.glsl  the shader source (edit this one)
+ghostty/flybrain.glsl           generated shader -- this is what Ghostty loads
+ghostty/preview.py              offscreen renderer to PNG / GPU timing (dev only)
+```
+
+### Setup
+
+1. `python ghostty/bake.py` (uses the cached connectome from the steps above; ~20 s).
+   Re-run it any time; `-n 400` neurons, `--slow 14` display slow-down.
+2. Add to `~/Library/Application Support/com.mitchellh.ghostty/config.ghostty`
+   (or `~/.config/ghostty/config`), using the absolute path to your clone:
+   ```
+   custom-shader = /absolute/path/to/flyweb/ghostty/flybrain.glsl
+   custom-shader-animation = always
+   ```
+3. Reload with **Cmd+Shift+,**.
+
+Tunables are `#define`s at the top of the shader: `GLOW_STRENGTH`, `BRAIN_FIT`,
+`TEXT_KEEPOUT`. Edit `flybrain.template.glsl` and re-bake (or edit the generated
+file directly for a quick try).
+
+### What you are looking at
+
+* **Neurons and synapses are real.** 400 neurons of the FlyWire release-783
+  connectome, at their real frontal (x, y) positions, levelled by principal axis.
+  Lines are their strongest real synaptic connections (by synapse count). The faint
+  blue haze is the density of all 139,248 neurons.
+* **Spikes are real, slowed down.** `bake.py` runs the repo's LIF model on the whole
+  brain under four sensory scenes (taste, sight, smell, touch), records each neuron's
+  first-spike latency and spike count, and the shader replays them 14x slower. A pulse
+  travels along an edge from the presynaptic neuron's spike to the postsynaptic
+  neuron's spike. Firing is periodic at the neuron's mean rate, not its exact spike
+  train. Between waves, faint random flicker keeps it alive.
+* Colour is predicted transmitter: cyan acetylcholine, pink GABA, amber glutamate,
+  green monoamines. Slightly dimmer means deeper in z.
+* **Text stays readable**: glow is removed on glyph pixels and a ~2 px halo around them
+  (measured against the background colour sampled from the window-padding corners; `iBackgroundColor` is not used because Ghostty leaves it at zero until the terminal state changes), and is tone-mapped to a low ceiling.
+  Light-background themes are not supported (the glow is additive).
+
+### Performance
+
+Per-pixel work is bounded by baked grid cells (each pixel only visits the few
+neurons/edges near it). Measured in an OpenGL harness on an M4: ~3.5 ms/frame at
+1440x900 and ~7.5 ms at 2880x1800. Not measured inside Ghostty itself, and not on older
+Airs -- if it stutters, shrink the window or lower `-n` and `--edges` in the bake.
+`custom-shader-animation = always` keeps the GPU redrawing continuously.
+
+### Verifying without Ghostty
+
+`python ghostty/preview.py --times 1 4 8 --out /tmp/fb` renders PNGs with a fake
+terminal on top (needs `pip install moderngl pillow`). `--bench` reports GPU time.
+
+### Recording a demo GIF
+
+1. Make the window a modest size (e.g. 1000x600) and run something with lots of text.
+2. Cmd+Shift+5, "Record Selected Portion", drag over the window, record ~13 s to
+   catch a full 12.8 s wave loop, stop from the menu bar.
+3. Convert (`brew install ffmpeg`):
+   ```
+   ffmpeg -i demo.mov -vf "fps=20,scale=900:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=192[p];[b][p]paletteuse=dither=bayer" demo.gif
+   ```
