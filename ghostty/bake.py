@@ -28,6 +28,8 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
+from scipy.spatial import cKDTree  # noqa: E402
+
 from flybrain.brain import Brain  # noqa: E402
 from flybrain.data import load  # noqa: E402
 
@@ -41,6 +43,17 @@ SCENES = [
 SIM_MS = 300.0          # simulated milliseconds per scene
 KIND = {"acetylcholine": 0, "gaba": 1, "glutamate": 2,
         "dopamine": 3, "serotonin": 3, "octopamine": 3}
+
+# Phase 2: typing. A grid of HX x HY cells covers the window; the cell under the
+# cursor picks one baked cascade. The window is mapped onto the brain's bounding
+# box (scaled by HMAP), and each cell force-fires the real neurons nearest to it.
+HX, HY, HMAP = 10, 6, 0.92
+TYP_SLOW = 8.0          # display slow-down of the typing cascades
+TYP_SIM_MS = 200.0
+TYP_TARGET = 30         # escalate the stimulus until this many shown neurons fire
+# (neurons forced, Hz, burst ms) -- weakest first
+LADDER = [(12, 200, 10), (40, 250, 20), (80, 300, 20), (160, 400, 30),
+          (320, 500, 30), (640, 500, 40)]
 
 # geometry, in units where the brain is 1.0 wide
 CELL = 0.04
@@ -195,6 +208,46 @@ def build_density(xy_all, aspect):
     return dict(hx=hx, hy=hy, nx=nx, ny=ny, vals=h.T.ravel())   # row-major, y down
 
 
+def build_typing(ann, W, sel, xy_all, aspect):
+    """Per grid cell: first-spike latency of each shown neuron after a burst of
+    forced spikes in the ~M real neurons nearest that cell (real LIF sim)."""
+    tree = cKDTree(xy_all)
+    shown_tree = cKDTree(xy_all[sel])
+    n = W.shape[0]
+    steps = int(TYP_SIM_MS / 0.5)
+    table = np.full((HX * HY, len(sel)), 255, dtype=np.uint8)
+    rung_used = np.zeros((HY, HX), dtype=int)
+    reach = np.zeros((HY, HX), dtype=int)
+    for iy in range(HY):
+        for ix in range(HX):
+            p = np.array([((ix + .5) / HX - .5) * HMAP, ((iy + .5) / HY - .5) * aspect * HMAP])
+            near_shown = sel[shown_tree.query(p, 3)[1]]
+            for r, (m, rate, burst) in enumerate(LADDER):
+                grp = np.union1d(tree.query(p, m)[1], near_shown)
+                b = Brain(ann, W)
+                first = np.full(n, -1.0)
+                stim = {int(i): float(rate) for i in grp}
+                rng = np.random.default_rng(iy * HX + ix)
+                for s in range(steps):
+                    fired = b.step(stim if s < burst * 2 else None, rng)
+                    fresh = fired[first[fired] < 0]
+                    first[fresh] = s * 0.5
+                got = int((first[sel] >= 0).sum())
+                if got >= TYP_TARGET:
+                    break
+            rung_used[iy, ix], reach[iy, ix] = r, got
+            t = first[sel]
+            q = np.round(t / 1000.0 * TYP_SLOW * 100.0)
+            table[iy * HX + ix] = np.where((t >= 0) & (q < 255), q, 255).astype(np.uint8)
+    return table, rung_used, reach
+
+
+def pack_u8(flat):
+    flat = np.concatenate([flat, np.full((-len(flat)) % 4, 255, dtype=np.uint8)]).astype(np.uint64)
+    w = flat.reshape(-1, 4)
+    return (w[:, 0] | (w[:, 1] << 8) | (w[:, 2] << 16) | (w[:, 3] << 24)).tolist()
+
+
 def arr(vals, fmt, per_line=8):
     items = [fmt(v) for v in vals]
     lines = [", ".join(items[i:i + per_line]) for i in range(0, len(items), per_line)]
@@ -202,7 +255,7 @@ def arr(vals, fmt, per_line=8):
 
 
 def emit(path_tmpl, path_out, xy, aspect, kind, depth, wave, edges, ew, grid,
-         slow, stagger, wave_dur, dens):
+         slow, stagger, wave_dur, dens, typing):
     nn, ne, nw = len(xy), len(edges), wave.shape[0]
     parts = [
         f"const int NN = {nn};\nconst int NE = {ne};\nconst int NW = {nw};",
@@ -210,6 +263,10 @@ def emit(path_tmpl, path_out, xy, aspect, kind, depth, wave, edges, ew, grid,
         f"const float CELL = {CELL};",
         f"const vec2 GMIN = vec2({grid['gmin'][0]:.4f}, {grid['gmin'][1]:.4f});",
         f"const float ASPECT = {aspect:.5f};",
+        f"const int HX = {HX};\nconst int HY = {HY};\nconst float HMAP = {HMAP};"
+        f"\nconst float TYP_DUR = {typing['dur']:.2f};",
+        f"const uint TYP[{len(typing['packed'])}] = uint[](\n    "
+        + arr(typing["packed"], lambda v: f"{v}u", 10) + "\n);",
         f"const int DX = {dens['nx']};\nconst int DY = {dens['ny']};\n"
         f"const float DSTEP = {DENS_STEP};\nconst vec2 DMIN = vec2({-dens['hx']:.4f}, {-dens['hy']:.4f});",
         f"const float DENS[DX * DY] = float[DX * DY](\n    "
@@ -316,11 +373,19 @@ def main():
     wave_dur = float(tail.max() + 0.6)
     print(f"wave duration {wave_dur:.2f}s, loop {args.stagger * nw:.1f}s")
 
+    print("typing cascades (real sim, per window cell) ...")
+    table, rung, reach = build_typing(ann, W, sel, xy_all, aspect)
+    print(f"  shown neurons reached per cell: min {reach.min()} median "
+          f"{int(np.median(reach))} max {reach.max()}; stimulus rung used "
+          f"{np.bincount(rung.ravel(), minlength=len(LADDER)).tolist()}")
+    latest = table[table < 255].max() / 100.0
+    typing = dict(packed=pack_u8(table.ravel()), dur=float(latest + 0.7))
+
     size = emit(HERE / "flybrain.template.glsl", args.out, xy, aspect, kind, depth, wave,
-                edges, ew, grid, args.slow, args.stagger, wave_dur, dens)
+                edges, ew, grid, args.slow, args.stagger, wave_dur, dens, typing)
     print(f"wrote {args.out} ({size / 1024:.0f} KiB)")
 
-    np.savez(HERE / "flybrain_subset.npz", sel=sel, xy=xy, kind=kind,
+    np.savez(HERE / "flybrain_subset.npz", typing_table=table, sel=sel, xy=xy, kind=kind,
              root_id=ann.root_id.values[sel], edges=np.array(edges),
              scenes=np.array([s[0] for s in SCENES]))
 

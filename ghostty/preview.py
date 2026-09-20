@@ -86,6 +86,8 @@ def main():
                     help="simulate Ghostty leaving iBackgroundColor at 0")
     ap.add_argument("--cursor", type=float, nargs=2, default=None)
     ap.add_argument("--cursor-age", type=float, default=0.3)
+    ap.add_argument("--cursor-at", type=float, default=None,
+                    help="absolute iTime of the cursor change (age = t - this)")
     args = ap.parse_args()
     w, h = args.size
 
@@ -121,7 +123,7 @@ def main():
             cx, cy = args.cursor
             set_u("iCurrentCursor", (cx, cy, 16.0, 34.0))
             set_u("iPreviousCursor", (cx - 16, cy, 16.0, 34.0))
-            set_u("iTimeCursorChange", t - args.cursor_age)
+            set_u("iTimeCursorChange", args.cursor_at if args.cursor_at is not None else t - args.cursor_age)
         vao.render()
 
     if args.bench:

@@ -140,7 +140,7 @@ ghostty/preview.py              offscreen renderer to PNG / GPU timing (dev only
 3. Reload with **Cmd+Shift+,**.
 
 Tunables are `#define`s at the top of the shader: `GLOW_STRENGTH`, `BRAIN_FIT`,
-`TEXT_KEEPOUT`. Edit `flybrain.template.glsl` and re-bake (or edit the generated
+`TEXT_KEEPOUT`, `TYPING_GAIN` (0 turns typing off), `TYPING_PULSES` (0 = cheaper). Edit `flybrain.template.glsl` and re-bake (or edit the generated
 file directly for a quick try).
 
 ### What you are looking at
@@ -160,6 +160,31 @@ file directly for a quick try).
 * **Text stays readable**: glow is removed on glyph pixels and a ~2 px halo around them
   (measured against the background colour sampled from the window-padding corners; `iBackgroundColor` is not used because Ghostty leaves it at zero until the terminal state changes), and is tone-mapped to a low ceiling.
   Light-background themes are not supported (the glow is additive).
+
+### Typing stimulates the brain
+
+Every cursor move (a keypress, Enter, program output) fires the brain near the matching
+spot: the terminal window is mapped onto the brain's bounding box, so top-left of your
+window is the brain's top-left, and a soft bloom marks the stimulus site.
+
+* **The cascade is the real sim.** For each cell of a 10x6 grid over the window,
+  `bake.py` force-fires the real neurons nearest that spot (a short Poisson burst) in
+  the full 139k-neuron LIF model and records when each of the 400 shown neurons first
+  spikes (`TYP` table, 1 byte per neuron per cell). The shader replays that from the
+  cell under the cursor (blended with its nearest neighbour cell), 8x slowed, with
+  pulses along the real edges.
+* **Stimulus strength is calibrated per cell**, not uniform: the same burst that
+  triggers a brain-wide cascade in the dense centre does nothing in the optic lobes.
+  The bake escalates the forced group (12 to 640 neurons, 200-500 Hz) until >= 30 of the
+  shown neurons respond. Cells at the very edge may still respond weakly (min 7).
+* **Ghostty limitation (stated plainly):** a shader is stateless and only receives the
+  current and previous cursor position plus the time of the last change. So each keypress
+  restarts the cascade at the new position, and the previous position is replayed with an
+  assumed 0.15 s offset (Ghostty does not report when it was set). Slow typing or a pause
+  shows the full spread; fast typing shows a rolling burst at the cursor. Cursor
+  moves are the only input: keys that don't move the cursor are invisible to the shader.
+* Cost: a cascade puts pulses on most edges for ~2 s, roughly +4 ms at 2880x1800 on an
+  M4 in my harness (`TYPING_PULSES 0` cuts most of that).
 
 ### Performance
 

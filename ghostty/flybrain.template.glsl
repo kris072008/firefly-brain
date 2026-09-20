@@ -5,10 +5,17 @@
 // strongest real synapses, and spike cascades replayed from the flyweb LIF
 // simulation (first-spike latency + rate per neuron, slowed down).
 //
-// Tweak these three and reload the config (Cmd+Shift+,):
+// Typing: every cursor move (a keypress) force-fires the real neurons nearest
+// the matching spot of the brain (window mapped onto it) and the baked LIF
+// cascade spreads from there. Ghostty gives shaders only the last two cursor
+// positions, so fast typing restarts the cascade at each key.
+//
+// Tweak these and reload the config (Cmd+Shift+,):
 #define GLOW_STRENGTH 1.0   // overall brightness of the brain
 #define BRAIN_FIT     0.94  // 1.0 = brain width fits the window
 #define TEXT_KEEPOUT  0.92  // 1.0 = no glow at all on/next to glyphs
+#define TYPING_GAIN   1.0   // 0.0 disables the typing response
+#define TYPING_PULSES 1     // 0 = typing lights neurons only (cheaper on the GPU)
 
 //@@DATA@@
 
@@ -28,17 +35,50 @@ float ambient(int j) {
     return r < 0.10 ? exp(-fract(ph) / 0.35 / 0.30) * 0.55 : 0.0;
 }
 
-// how strongly neuron j is spiking right now in wave m (0..1)
+// Channels 0..NW-1 are the ambient sensory waves; NW is the current cursor
+// event and NW+1 the previous one.
+#define NCH (NW + 2)
+int gHubA[2];
+int gHubB[2];
+
+// first-spike time of neuron j in channel m, seconds since the channel started
+float arrival(int m, int j) {
+    if (m < NW) return WAVE[m * NN + j].x;
+    int c = m - NW;
+    int i0 = gHubA[c] * NN + j;
+    int i1 = gHubB[c] * NN + j;
+    int q0 = int((TYP[i0 >> 2] >> uint((i0 & 3) * 8)) & 255u);
+    int q1 = int((TYP[i1 >> 2] >> uint((i1 & 3) * 8)) & 255u);
+    int q = min(q0, q1);
+    return q >= 255 ? -1.0 : float(q) * 0.01;
+}
+
+// how strongly neuron j is spiking right now in channel m (0..1)
 float spike(int m, int j, float tl) {
-    vec3 w = WAVE[m * NN + j];
-    if (w.x < 0.0) return 0.0;
-    float age = tl - w.x;
+    float t0 = arrival(m, j);
+    if (t0 < 0.0) return 0.0;
+    float age = tl - t0;
     if (age < 0.0) return 0.0;
-    if (w.y > 0.0) {
-        float k = min(floor(age / w.y), w.z - 1.0);
-        age -= k * w.y;
+    if (m < NW) {
+        vec3 w = WAVE[m * NN + j];
+        if (w.y > 0.0) age -= min(floor(age / w.y), w.z - 1.0) * w.y;
+        return exp(-age / 0.28);
     }
-    return exp(-age / 0.28);
+    return exp(-age / 0.22);
+}
+
+// window position -> the two nearest cascade cells (nearest, and its
+// neighbour across the closest cell boundary, so movement blends smoothly)
+void hubsFor(vec2 u, out int a, out int b) {
+    vec2 g = clamp(u, 0.001, 0.999) * vec2(float(HX), float(HY));
+    ivec2 i = ivec2(floor(g));
+    vec2 f = g - vec2(i);
+    ivec2 k = i;
+    if (abs(f.x - 0.5) > abs(f.y - 0.5)) k.x += f.x < 0.5 ? -1 : 1;
+    else k.y += f.y < 0.5 ? -1 : 1;
+    k = clamp(k, ivec2(0), ivec2(HX - 1, HY - 1));
+    a = i.y * HX + i.x;
+    b = k.y * HX + k.x;
 }
 
 // faint neuropil haze: blurred density of all 139k neurons, bilinear
@@ -60,19 +100,54 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float pxu = 1.0 / scale;                                // one pixel, brain units
     vec2 p = (fragCoord - 0.5 * res) / scale;
 
+    // ---- cursor events -> typing channels ---------------------------------
+    float tcur = -1.0, tprev = -1.0;
+    vec2 bloomP = vec2(0.0);
+    float bloom = 0.0;
+    gHubA[0] = gHubB[0] = gHubA[1] = gHubB[1] = 0;
+    if (TYPING_GAIN > 0.0 && iCurrentCursor.z > 0.0) {
+        // xy is the cursor's left / bottom edge, y down (Ghostty on Metal)
+        vec2 uc = vec2(iCurrentCursor.x + 0.5 * iCurrentCursor.z,
+                       iCurrentCursor.y - 0.5 * iCurrentCursor.w) / res;
+        float age = iTime - iTimeCursorChange;
+        if (age >= 0.0 && age < TYP_DUR) {
+            tcur = age;
+            hubsFor(uc, gHubA[0], gHubB[0]);
+            bloomP = (uc - 0.5) * vec2(1.0, ASPECT) * HMAP;
+            bloom = exp(-age / 0.30);
+        }
+        // Ghostty does not say when the previous cursor position was set;
+        // assume one typing beat (0.15 s) before the current one.
+        if (iPreviousCursor.z > 0.0 && iPreviousCursor.xy != iCurrentCursor.xy
+            && age + 0.15 < TYP_DUR) {
+            vec2 up = vec2(iPreviousCursor.x + 0.5 * iPreviousCursor.z,
+                           iPreviousCursor.y - 0.5 * iPreviousCursor.w) / res;
+            tprev = age + 0.15;
+            hubsFor(up, gHubA[1], gHubB[1]);
+        }
+    }
+
+    int mEnd = (tcur >= 0.0 || tprev >= 0.0) ? NCH : NW;   // typing channels only while active
+
     float hz = haze(p);
     vec3 glow = vec3(0.09, 0.19, 0.40) * hz * (0.55 + 0.10 * sin(iTime * 0.4 + p.x * 5.0));
+    if (bloom > 0.0) {
+        vec2 bd = p - bloomP;
+        glow += vec3(0.45, 0.80, 1.0) * exp(-dot(bd, bd) / 0.0018) * bloom * 0.9 * TYPING_GAIN;
+    }
     ivec2 c = ivec2(floor((p - GMIN) / CELL));
 
     if (c.x >= 0 && c.y >= 0 && c.x < GX && c.y < GY) {
         int ci = c.y * GX + c.x;
 
-        // local time of each wave in its loop slot; < 0 means idle
-        float tw[NW];
+        // local time of each channel; < 0 means idle
+        float tw[NCH];
         for (int m = 0; m < NW; m++) {
             float t = mod(iTime - float(m) * STAGGER, LOOP);
             tw[m] = t < WAVE_DUR ? t : -1.0;
         }
+        tw[NW] = tcur;
+        tw[NW + 1] = tprev;
 
         // ---- synapses: faint static lines + travelling spikes ------------
         for (int k = CELL_E_START[ci]; k < CELL_E_START[ci + 1]; k++) {
@@ -91,11 +166,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
             float amb = 0.045 + 0.06 * EW[e];
             float pulse = 0.0;
             float sp = max(0.0042, pxu * 1.2);
-            for (int m = 0; m < NW; m++) {
+            for (int m = 0; m < (TYPING_PULSES == 1 ? mEnd : NW); m++) {
                 if (tw[m] < 0.0) continue;
-                float ta = WAVE[m * NN + ia].x, tb = WAVE[m * NN + ib].x;
+                float ta = arrival(m, ia), tb = arrival(m, ib);
                 if (ta < 0.0 || tb <= ta) continue;
-                float trv = clamp(tb - ta, 0.20, 0.90);
+                float trv = clamp(tb - ta, m < NW ? 0.20 : 0.10, m < NW ? 0.90 : 0.45);
                 float s = (tw[m] - (tb - trv)) / trv;
                 if (s <= 0.0 || s >= 1.15) continue;
                 float along = (s - h) * len;
@@ -117,7 +192,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
             if (r2 > 0.0016) continue;
 
             float act = ambient(j);
-            for (int m = 0; m < NW; m++) {
+            for (int m = 0; m < mEnd; m++) {
                 if (tw[m] >= 0.0) act = max(act, spike(m, j, tw[m]));
             }
             float near = 1.0 - 0.45 * NDEPTH[j];
