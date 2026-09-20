@@ -10,12 +10,19 @@
 // cascade spreads from there. Ghostty gives shaders only the last two cursor
 // positions, so fast typing restarts the cascade at each key.
 //
+// Live mode: when `python ghostty/daemon.py` is hosting your shell, the last
+// terminal row carries the running simulation as coloured cells. This shader
+// finds that row from the block cursor's geometry, decodes it, hides it, and
+// draws the real activity instead of the baked replay.
+//
 // Tweak these and reload the config (Cmd+Shift+,):
 #define GLOW_STRENGTH 1.0   // overall brightness of the brain
 #define BRAIN_FIT     0.94  // 1.0 = brain width fits the window
 #define TEXT_KEEPOUT  0.92  // 1.0 = no glow at all on/next to glyphs
 #define TYPING_GAIN   1.0   // 0.0 disables the typing response
 #define TYPING_PULSES 1     // 0 = typing lights neurons only (cheaper on the GPU)
+#define LIVE          1     // 0 = never look for the daemon's data strip
+#define LIVE_DEBUG    0     // 1 = status square top-right, 2 = + decoded levels, 3 = + raw diagnostics
 
 //@@DATA@@
 
@@ -81,6 +88,161 @@ void hubsFor(vec2 u, out int a, out int b) {
     b = k.y * HX + k.x;
 }
 
+// ---- live strip ------------------------------------------------------------
+// Must match ghostty/daemon.py: 3 header cells, then 6 neurons per cell, each
+// neuron a 2-bit level, two neurons packed into one 4-bit channel value (byte 17*v).
+const int LIVE_HEADER = 3;
+const int LIVE_PER_CELL = 6;
+const float LIVE_LEVEL[4] = float[4](0.0, 0.30, 0.62, 1.0);
+
+bool gStrip = false;     // the strip row was found: hide it
+bool gLive = false;      // ... and its cells could be located: decode it
+float gCw, gCh, gX0, gYc;
+int gCols;
+int gStage = 0;                    // 0 no usable cursor, 1 row not found, 2 cell width failed, 3 calibration cell failed, 4 live
+float gDbgCw = 0.0, gDbgX0 = 0.0, gDbgM = 0.0;
+
+// Texel-exact probe: snapping to the texel centre makes every probe independent
+// of the sampler's filtering (a linear sampler would blend at cell edges).
+vec3 tx(vec2 p) { return texture(iChannel0, (floor(p) + 0.5) / iResolution.xy).rgb; }
+
+// Header colours as they can arrive. Ghostty's Metal renderer converts every sRGB
+// cell colour to Display P3 before it reaches this texture, so pure green (0,1,0)
+// reads as (0.46, 0.98, 0.30), and as (0.18, 0.97, 0.07) under linear blending.
+// The classes are therefore wide hues, not exact values.
+bool isA(vec2 p) {          // magenta, sent as (255, 0, 255)
+    vec3 c = tx(p);
+    return c.r > 0.6 && c.b > 0.6 && c.g < 0.36 && c.r - c.g > 0.4 && c.b - c.g > 0.4;
+}
+bool isB(vec2 p) {          // green, sent as (0, 255, 0)
+    vec3 c = tx(p);
+    return c.g > 0.7 && c.r < 0.55 && c.b < 0.45 && c.g - c.r > 0.35 && c.g - c.b > 0.4;
+}
+
+// sRGB transfer function and the Display P3 -> sRGB matrix (inverse of the
+// sRGB -> P3 matrix in Ghostty's shaders.metal, column-major)
+vec3 toLinear(vec3 c) {
+    c = max(c, 0.0);
+    return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, vec3(lessThanEqual(c, vec3(0.04045))));
+}
+vec3 toEncoded(vec3 l) {
+    l = clamp(l, 0.0, 1.0);
+    return mix(pow(l, vec3(1.0 / 2.4)) * 1.055 - 0.055, l * 12.92, vec3(lessThanEqual(l, vec3(0.0031308))));
+}
+const mat3 P3_TO_SRGB = mat3(vec3(1.2248008, -0.0420271, -0.0197195),
+                             vec3(-0.2246659, 1.0419545, -0.0786201),
+                             vec3(-0.0000455, 0.0000819, 1.0979025));
+bool gLinearTex = false;   // texture reads back linear values (alpha-blending = linear)
+bool gConverted = true;    // colours were converted sRGB -> Display P3 (the default)
+
+// what the daemon wrote (sRGB, 0..1) from what the texture holds
+vec3 sentColor(vec3 s) {
+    vec3 lin = gLinearTex ? s : toLinear(s);
+    if (gConverted) lin = P3_TO_SRGB * lin;
+    return toEncoded(lin);
+}
+
+// Where the strip is, in three steps of decreasing certainty:
+//  1. its ROW, from the cursor rectangle's height and vertical position (exact
+//     for block, hollow and bar cursors), confirmed by the magic colour in cell 0.
+//     This alone is enough to hide the strip.
+//  2. its CELL WIDTH and left edge. A block cursor is exactly one cell wide; for
+//     a bar cursor (Ghostty's zsh integration uses one at the prompt) they are
+//     measured from the strip itself: cell 0 is a known colour, so its edges can
+//     be found by bisection.
+//  3. how Ghostty's render target altered the colours (P3 conversion, linear
+//     blending), from the header cells; see sentColor().
+void liveGeometry(vec2 res) {
+    gStrip = false;
+    gLive = false;
+    gStage = 0;
+    if (LIVE == 0) return;
+    float ch = iCurrentCursor.w;
+    if (iCurrentCursorStyle > CURSORSTYLE_BAR || ch < 8.0 || iCurrentCursor.z < 1.0) return;
+
+    float xm = clamp(0.45 * ch, 10.0, 22.0);          // a point inside cell 0
+    float y0 = mod(iCurrentCursor.y, ch);
+    float rows = floor((res.y - y0) / ch);
+    float yc = -1.0;
+    for (int k = 0; k < 2; k++) {                       // bottom padding may cost a row
+        float y = y0 + (rows - 1.0 - float(k) + 0.5) * ch;
+        if (isA(vec2(xm, y))) { yc = y; break; }
+    }
+    gStage = 1;
+    if (yc < 0.0) return;
+    gStage = 2;
+    gStrip = true;
+    gCh = ch;
+    gYc = yc;
+
+    float x0 = 0.0, cw = 0.0;
+    bool ok = false;
+    if (iCurrentCursorStyle != CURSORSTYLE_BAR) {
+        for (int t = 0; t < 2 && !ok; t++) {           // t = 1: cursor on a double-width glyph
+            cw = iCurrentCursor.z * (t == 0 ? 1.0 : 0.5);
+            x0 = mod(iCurrentCursor.x, cw);
+            ok = isA(vec2(x0 + 0.5 * cw, yc)) && isB(vec2(x0 + 1.5 * cw, yc));
+        }
+    }
+    if (!ok) {
+        float lo = 0.0, hi = xm;                        // left edge of cell 0
+        for (int i = 0; i < 5; i++) {
+            float mid = 0.5 * (lo + hi);
+            if (isA(vec2(mid, yc))) hi = mid; else lo = mid;
+        }
+        x0 = floor(hi);                                 // probes are texel-exact: edges are integers
+        lo = x0 + 0.25 * ch; hi = x0 + 1.0 * ch;        // right edge of cell 0
+        for (int i = 0; i < 6; i++) {
+            float mid = 0.5 * (lo + hi);
+            if (isA(vec2(mid, yc))) lo = mid; else hi = mid;
+        }
+        cw = floor(hi) - x0;
+        ok = cw >= 4.0 && isA(vec2(x0 + 0.5 * cw, yc)) && isB(vec2(x0 + 1.5 * cw, yc));
+    }
+    gDbgCw = cw;
+    gDbgX0 = x0;
+    if (!ok) return;
+    gStage = 3;
+
+    vec3 m = tx(vec2(x0 + 2.5 * cw, yc));               // written as 128/255 grey
+    gDbgM = m.r;
+    if (m.r < 0.10 || m.r > 0.65 || abs(m.r - m.g) > 0.05 || abs(m.r - m.b) > 0.05) return;
+    gLinearTex = m.r < 0.35;                            // 0.502 native, 0.216 when the texture is linear
+    vec3 g = tx(vec2(x0 + 1.5 * cw, yc));               // green: red > 0 only if colours were converted
+    gConverted = g.r > (gLinearTex ? 0.09 : 0.23);
+    gCw = cw;
+    gX0 = x0;
+    gCols = int(floor((res.x - x0) / cw));
+    gStage = 4;
+    gLive = true;
+}
+
+const int FONT3X5[10] = int[10](0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7249, 0x7BEF, 0x7BCF);
+// 5-digit number in a 3x5 pixel font; p is in glyph pixels (4 per digit incl. gap)
+float numInk(float value, vec2 p) {
+    if (p.y < 0.0 || p.y >= 5.0 || p.x < 0.0 || p.x >= 20.0) return 0.0;
+    int digit = int(p.x / 4.0);
+    int gx = int(p.x - float(digit) * 4.0);
+    if (gx > 2) return 0.0;
+    int v = int(max(value, 0.0));
+    int dv = digit == 0 ? 10000 : (digit == 1 ? 1000 : (digit == 2 ? 100 : (digit == 3 ? 10 : 1)));
+    int d = (v / dv) - ((v / dv) / 10) * 10;
+    return float((FONT3X5[d] >> (14 - (int(p.y) * 3 + gx))) & 1);
+}
+
+// activity of neuron j from the strip: 0..1, or -1 if its cell is not on screen
+float liveAct(int j) {
+    int c = LIVE_HEADER + j / LIVE_PER_CELL;
+    if (c >= gCols - 1) return -1.0;
+    int r = j - (j / LIVE_PER_CELL) * LIVE_PER_CELL;
+    int chn = r / 2;
+    vec3 s = sentColor(tx(vec2(gX0 + (float(c) + 0.5) * gCw, gYc)));
+    float v = chn == 0 ? s.r : (chn == 1 ? s.g : s.b);
+    int q = int(floor(v * 15.0 + 0.5));
+    int lvl = (r - chn * 2) == 1 ? (q >> 2) & 3 : q & 3;
+    return LIVE_LEVEL[lvl];
+}
+
 // faint neuropil haze: blurred density of all 139k neurons, bilinear
 float haze(vec2 p) {
     vec2 g = (p - DMIN) / DSTEP - 0.5;
@@ -100,12 +262,15 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     float pxu = 1.0 / scale;                                // one pixel, brain units
     vec2 p = (fragCoord - 0.5 * res) / scale;
 
+    liveGeometry(res);
+    bool inStrip = gStrip && fragCoord.y >= gYc - 0.5 * gCh;
+
     // ---- cursor events -> typing channels ---------------------------------
     float tcur = -1.0, tprev = -1.0;
     vec2 bloomP = vec2(0.0);
     float bloom = 0.0;
     gHubA[0] = gHubB[0] = gHubA[1] = gHubB[1] = 0;
-    if (TYPING_GAIN > 0.0 && iCurrentCursor.z > 0.0) {
+    if (!gLive && TYPING_GAIN > 0.0 && iCurrentCursor.z > 0.0) {
         // xy is the cursor's left / bottom edge, y down (Ghostty on Metal)
         vec2 uc = vec2(iCurrentCursor.x + 0.5 * iCurrentCursor.z,
                        iCurrentCursor.y - 0.5 * iCurrentCursor.w) / res;
@@ -144,7 +309,7 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         float tw[NCH];
         for (int m = 0; m < NW; m++) {
             float t = mod(iTime - float(m) * STAGGER, LOOP);
-            tw[m] = t < WAVE_DUR ? t : -1.0;
+            tw[m] = (t < WAVE_DUR && !gLive) ? t : -1.0;
         }
         tw[NW] = tcur;
         tw[NW + 1] = tprev;
@@ -166,6 +331,19 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
             float amb = 0.045 + 0.06 * EW[e];
             float pulse = 0.0;
             float sp = max(0.0042, pxu * 1.2);
+            if (gLive) {
+                // real firing of the presynaptic neuron drives the pulses; where
+                // along the edge a pulse sits is cosmetic (the strip carries
+                // firing levels, not sub-frame spike timing)
+                float la = max(liveAct(ia), 0.0);
+                amb *= 1.0 + 1.6 * la;
+                if (la > 0.05) {
+                    float s = fract(iTime * 0.75 + hash11(float(e) * 3.1));
+                    float along = (s - h) * len;
+                    float tailv = along >= 0.0 ? exp(-along / 0.035) : exp(-along * along / 1.6e-5);
+                    pulse += tailv * la * (0.55 + 0.6 * EW[e]);
+                }
+            }
             for (int m = 0; m < (TYPING_PULSES == 1 ? mEnd : NW); m++) {
                 if (tw[m] < 0.0) continue;
                 float ta = arrival(m, ia), tb = arrival(m, ib);
@@ -192,6 +370,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
             if (r2 > 0.0016) continue;
 
             float act = ambient(j);
+            float la = gLive ? liveAct(j) : -1.0;
+            if (la >= 0.0) act = la;
             for (int m = 0; m < mEnd; m++) {
                 if (tw[m] >= 0.0) act = max(act, spike(m, j, tw[m]));
             }
@@ -215,7 +395,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     // rather than from iBackgroundColor, which Ghostty only fills in after the
     // terminal state changes and which is zero until then.
     float ink = 0.0;
-    if (max(glow.r, max(glow.g, glow.b)) > 0.003) {
+    vec3 base = term.rgb;
+    if (inStrip || max(glow.r, max(glow.g, glow.b)) > 0.003) {
         vec3 k0 = texture(iChannel0, vec2(1.5, 1.5) / res).rgb;
         vec3 k1 = texture(iChannel0, vec2(res.x - 1.5, 1.5) / res).rgb;
         vec3 k2 = texture(iChannel0, vec2(1.5, res.y - 1.5) / res).rgb;
@@ -228,14 +409,56 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
         if (s1 < sb) { bg = k1; sb = s1; }
         if (s2 < sb) { bg = k2; sb = s2; }
         if (s3 < sb) { bg = k3; }
-        for (int i = 0; i < 5; i++) {
-            vec2 o = i == 0 ? vec2(0.0) : vec2(i == 1 ? 1.8 : (i == 2 ? -1.8 : 0.0),
-                                               i == 3 ? 1.8 : (i == 4 ? -1.8 : 0.0));
-            vec3 s = texture(iChannel0, (fragCoord + o) / res).rgb;
-            ink = max(ink, smoothstep(0.03, 0.14, distance(s, bg)));
+        if (inStrip) {
+            base = bg;                       // hide the data strip
+        } else {
+            for (int i = 0; i < 5; i++) {
+                vec2 o = i == 0 ? vec2(0.0) : vec2(i == 1 ? 1.8 : (i == 2 ? -1.8 : 0.0),
+                                                   i == 3 ? 1.8 : (i == 4 ? -1.8 : 0.0));
+                vec3 s = texture(iChannel0, (fragCoord + o) / res).rgb;
+                ink = max(ink, smoothstep(0.03, 0.14, distance(s, bg)));
+            }
         }
     }
     glow *= 1.0 - TEXT_KEEPOUT * ink;
 
-    fragColor = vec4(term.rgb + glow, term.a);
+    vec3 outc = base + glow;
+#if LIVE_DEBUG > 0
+    // green: strip found and decoded (live)   orange: found and hidden but not
+    // decoded   red: no strip found (baked animation)
+    vec2 dq = vec2(res.x - fragCoord.x, fragCoord.y);
+    if (dq.x > 12.0 && dq.x < 52.0 && dq.y > 12.0 && dq.y < 52.0)
+        outc = gLive ? vec3(0.0, 1.0, 0.2) : (gStrip ? vec3(1.0, 0.6, 0.0) : vec3(1.0, 0.1, 0.1));
+#if LIVE_DEBUG > 1
+    // first 64 neurons as a row of squares under the status square: their
+    // brightness is the decoded activity level (dark blue = cell not delivered)
+    if (dq.y > 62.0 && dq.y < 86.0 && dq.x > 12.0 && dq.x < 12.0 + 64.0 * 12.0) {
+        int j = 63 - int((dq.x - 12.0) / 12.0);
+        float la = gLive ? liveAct(j) : -1.0;
+        outc = la < 0.0 ? vec3(0.0, 0.0, 0.4) : vec3(la);
+    }
+#if LIVE_DEBUG > 2
+    // ---- diagnostic block under the squares (see README): a 2x magnified copy of
+    // the strip row's raw pixels, then numbers, 5 digits each, one per row
+    vec2 lp = fragCoord - vec2(res.x - 520.0, 100.0);
+    if (lp.x >= 0.0 && lp.x < 480.0 && lp.y >= 0.0 && lp.y < 24.0) {
+        outc = tx(vec2(lp.x * 0.5, gStrip ? gYc : res.y - 20.0));
+    } else if (lp.x >= 0.0 && lp.x < 100.0 && lp.y >= 32.0 && lp.y < 32.0 + 13.0 * 21.0) {
+        int row = int((lp.y - 32.0) / 21.0);
+        float ry = lp.y - 32.0 - float(row) * 21.0;
+        vec2 gp = vec2((lp.x - 30.0) / 3.0, ry / 3.0);
+        float vals[13] = float[13](float(iCurrentCursorStyle), iCurrentCursor.x, iCurrentCursor.y,
+            iCurrentCursor.z, iCurrentCursor.w, float(gStage), gDbgCw * 10.0, gDbgX0 * 10.0,
+            gDbgM * 1000.0, res.x, res.y, float(gCols),
+            float((gLinearTex ? 1 : 0) + (gConverted ? 2 : 0)));
+        if (lp.x < 24.0) {
+            outc = vec3(0.5 + 0.5 * sin(float(row) * 2.1), 0.5 + 0.5 * sin(float(row) * 3.3 + 1.0), 0.5 + 0.5 * sin(float(row) * 5.7 + 2.0));
+        } else {
+            outc = mix(vec3(0.0), vec3(1.0), numInk(vals[row], gp));
+        }
+    }
+#endif
+#endif
+#endif
+    fragColor = vec4(outc, term.a);
 }

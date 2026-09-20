@@ -124,7 +124,9 @@ real connectome behind your terminal text. Tested against Ghostty 1.3.1 on macOS
 ghostty/bake.py                 runs the LIF sim, picks neurons/edges, writes flybrain.glsl
 ghostty/flybrain.template.glsl  the shader source (edit this one)
 ghostty/flybrain.glsl           generated shader -- this is what Ghostty loads
+ghostty/daemon.py               live bridge: runs the sim and streams it into the shader (Phase 3)
 ghostty/preview.py              offscreen renderer to PNG / GPU timing (dev only)
+ghostty/selftest*.py            headless tests for the bridge and the shader decode (dev only)
 ```
 
 ### Setup
@@ -185,6 +187,108 @@ window is the brain's top-left, and a soft bloom marks the stimulus site.
   moves are the only input: keys that don't move the cursor are invisible to the shader.
 * Cost: a cascade puts pulses on most edges for ~2 s, roughly +4 ms at 2880x1800 on an
   M4 in my harness (`TYPING_PULSES 0` cuts most of that).
+
+### Live simulation bridge
+
+Instead of replaying a baked recording, the brain on screen can be the running
+simulation. A Ghostty shader cannot read files or sockets -- its only input is what is
+drawn in the terminal -- so the daemon smuggles the data in through the terminal itself.
+
+```
+.venv/bin/python ghostty/daemon.py      # run this in a Ghostty window; it hosts your shell
+```
+
+Everything you type from then on happens inside the bridge (`exit` leaves it). Nothing in this
+project edits your shell startup files. If you *want* it to start with every terminal, put `exec /path/to/flyweb/.venv/bin/python /path/to/flyweb/ghostty/daemon.py --rc`
+at the end of your `~/.zshrc`; `--rc` makes nested shells detect the bridge and quietly start a
+plain shell. Typed by hand inside a bridge, the daemon refuses and says so.
+The shader config does not change. While the connectome loads (~2 s) you keep the baked
+animation; when the strip appears it switches to live, and back if the daemon exits.
+
+What drives it (all real LIF simulation, `--speed` x real time, default 0.1):
+* **your typing** stimulates the mechanosensory neurons, **your terminal output** the
+  visual ones, so the brain visibly responds to what you do;
+* a 32 s cycle of taste / sight / touch / smell "scenes" keeps it busy when you are idle.
+
+Things I found while tuning that you may see: the connectome model is bistable. Smell input
+(or a stray spike among the strongly wired hub neurons once the network is primed) tips it
+into a brain-wide self-sustaining storm that does not stop when the input does. So every
+scene starts from a reset brain, smell is a short burst that is quenched mid-scene, and a
+watchdog resets any storm that outlasts its input. Resting periods are genuinely quiet.
+
+How the data gets across:
+* The daemon runs your shell on a private pty **one row shorter** than the window and
+  owns the last row (it also sets the scroll region so nothing scrolls into it). It repaints
+  that row ~30x/s with truecolor background blocks, one column per cell. Cells 0-2 are a
+  header (two magic colours and a mid-grey used to undo any gamma change in Ghostty's render
+  target); the rest carry a 2-bit activity level (decayed spike trace) for each of the 400
+  neurons, six per cell -- so **the window needs ~72 columns** for all of them; on a
+  narrower window the missing neurons simply stay dark.
+* The shader finds that row **from the cursor rectangle** (`iCurrentCursor`): its height
+  and vertical position give the row grid (exact for block, hollow and bar cursors), and the
+  magic colour in cell 0 confirms it. That alone is enough to **hide** the strip. Cell width
+  comes from a block cursor's width, or -- for a bar cursor, which Ghostty's zsh integration
+  puts at the prompt -- is measured off the strip itself by bisecting the edges of cell 0.
+  So nothing depends on font size, DPI, window padding or window size, and resizes just
+  work (the daemon tracks SIGWINCH and repaints the new last row; the shell is told it has
+  one row fewer). It then samples one texel per neuron, undoes Ghostty's colour conversion using the
+  header cells to undo Ghostty's colour conversion, hides the row, and draws the brain from the decoded levels.
+* Live pulses on edges are driven by the real firing of the presynaptic neuron, but *where*
+  along the edge a pulse sits is cosmetic: the strip carries firing levels at ~30 Hz, not
+  sub-frame spike timing.
+
+
+**Checking that live mode is really decoding.** The shader has a debug overlay (`LIVE_DEBUG`
+in `flybrain.template.glsl`; edit the generated `flybrain.glsl` and reload with Cmd+Shift+,
+for a quick try, or re-bake). Levels: 1 = status square, 2 = + decoded levels, 3 = + raw
+diagnostics. In the top-right corner of the window:
+
+* **green square**: strip found *and decoded* -- the brain is the live simulation.
+* **orange square**: the strip row was found and hidden but the cells could not be located or
+  read. You are seeing the baked animation.
+* **red square**: no strip found (daemon not running, still loading, an underline cursor, or
+  the window too narrow). Baked animation.
+* Under the square, 64 grey squares show the decoded levels of neurons 0-63, left to right
+  (black silent ... white just fired; dark blue = not decoded / not delivered).
+
+For a decisive test run `.venv/bin/python ghostty/daemon.py --pattern` in a *fresh* window
+(not inside another bridge): a wave slides along those 64 squares, ~4 s per repeat. (It sweeps
+neuron *numbers*, which are not in spatial order, so the brain itself just shows scattered
+flashes.)
+
+Level 3 adds, below that, what the shader actually sees, for bug reports:
+a 2x magnified copy of the strip row's raw pixels (expect magenta, green, grey, then payload
+cells), and thirteen numbers, top to bottom: cursor style (0 block, 1 hollow, 2 bar, 3 underline),
+cursor x, cursor y (bottom edge), cursor width, cursor height, **stage** (0 no usable cursor,
+1 row not found, 2 cell width not found, 3 calibration cell unreadable, 4 live), cell width x10,
+left padding x10, calibration cell brightness x1000 (~500 normally), window width, window
+height, decoded columns, and colour mode (1 = texture is linear, 2 = colours were converted
+to Display P3; the Ghostty default is 2).
+A screenshot of that block pins down a decode failure.
+
+Why the colours need decoding: Ghostty's Metal renderer *always* outputs Display P3. Even with
+`window-colorspace = srgb` it linearises each cell colour, multiplies by an sRGB-to-P3 matrix
+and re-encodes, so the texture a shader samples holds converted values (pure green reads as
+about 0.46, 0.98, 0.30), and under `alpha-blending = linear` it holds linear values. The
+shader recognises the header cells by hue, works out which mode it is in from the green and
+grey cells, and applies the exact inverse. The tests model all four combinations
+(converted or not, native or linear).
+
+Limitations, plainly:
+* **Block, hollow-block and bar cursors work.** With an underline cursor (or before Ghostty
+  has drawn a cursor at all) the shader cannot locate the row: the strip stays visible and
+  you get the baked animation. A hidden cursor keeps the last known geometry.
+* It costs CPU: the 139k-neuron simulation takes ~35% of one core at `--speed 0.1` (about
+  50% at 0.15), measured on an M4. `--speed 0.05` is much lighter and still shows cascades.
+* One row of your terminal is used up, and programs that address the last row absolutely
+  are told the terminal is one row shorter, so they never touch it.
+* Not covered: a shell that resets the scroll region with sequences the daemon does not
+  watch for; running the daemon under another multiplexer's status line.
+* Verified headlessly, not in Ghostty itself: `python ghostty/selftest.py --shader` (needs
+  `pip install pyte moderngl pillow`) runs the daemon in an emulated terminal (scrolling,
+  Ctrl-C, alternate screen, growing/shrinking the window, cursor starting on the bottom row)
+  and renders strips at five font-size / padding setups, with and without a gamma change,
+  through the real shader.
 
 ### Performance
 

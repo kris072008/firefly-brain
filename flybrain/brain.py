@@ -37,6 +37,7 @@ class Brain:
         p = self.p
         self.v = np.full(self.n, p.v_rest, dtype=np.float32)
         self.i_syn = np.zeros(self.n, dtype=np.float32)
+        self._tmp = np.empty(self.n, dtype=np.float32)
         self.refrac = np.zeros(self.n, dtype=np.float32)
         self._decay_i = np.float32(np.exp(-p.dt / p.tau_syn))
         self._dt_over_tau = np.float32(p.dt / p.tau_m)
@@ -48,6 +49,13 @@ class Brain:
         self.spike_counts = np.zeros(self.n, dtype=np.int64)
         self.fired_mask = np.zeros(self.n, dtype=bool)
 
+    def reset(self) -> None:
+        """Back to the resting state: no voltage, current, refractoriness or spikes in flight."""
+        self.v[:] = self.p.v_rest
+        self.i_syn[:] = 0
+        self.refrac[:] = 0
+        self._buf = [np.empty(0, dtype=np.int32) for _ in self._buf]
+
     # ---- selecting neurons -------------------------------------------------
     def select(self, **kwargs) -> np.ndarray:
         """select(cell_sub_class="sugar/water", side="left") -> row indices."""
@@ -58,9 +66,10 @@ class Brain:
         return np.flatnonzero(mask).astype(np.int32)
 
     # ---- simulation --------------------------------------------------------
-    def step(self, stim: dict[int, float] | None = None,
+    def step(self, stim: dict[int, float] | tuple[np.ndarray, np.ndarray] | None = None,
              rng: np.random.Generator | None = None) -> np.ndarray:
-        """Advance dt. `stim` maps neuron index -> Poisson drive rate in Hz.
+        """Advance dt. `stim` maps neuron index -> Poisson drive rate in Hz,
+        or is a pair of arrays (indices, rates) for large drive sets.
 
         Returns the indices of neurons that spiked this step.
         """
@@ -79,14 +88,23 @@ class Brain:
         #    it, so one synapse is worth ~0.043 mV and roughly 160 coincident
         #    synapses are needed to reach threshold. Adding epsp straight to v
         #    makes every neuron ~23x too excitable and the brain saturates.
+        #    Done in place with `where=` masks over the whole array: identical
+        #    arithmetic to indexing with the mask, without the temporaries.
         live = self.refrac <= 0
-        self.v[live] += (p.v_rest - self.v[live] + self.i_syn[live]) * self._dt_over_tau
+        tmp = self._tmp
+        np.subtract(p.v_rest, self.v, out=tmp)
+        tmp += self.i_syn
+        tmp *= self._dt_over_tau
+        np.add(self.v, tmp, out=self.v, where=live)
         self.i_syn *= self._decay_i
-        self.refrac[~live] -= p.dt
+        np.subtract(self.refrac, p.dt, out=self.refrac, where=~live)
 
         # 3. external drive: independent Poisson spikes forced onto sensory cells
         forced = np.empty(0, dtype=np.int32)
-        if stim:
+        if isinstance(stim, tuple):
+            idx, rate = stim
+            forced = idx[rng.random(idx.size) < rate * p.dt]
+        elif stim:
             idx = np.fromiter(stim.keys(), dtype=np.int32, count=len(stim))
             rate = np.fromiter(stim.values(), dtype=np.float32, count=len(stim))
             forced = idx[rng.random(idx.size) < rate * p.dt]

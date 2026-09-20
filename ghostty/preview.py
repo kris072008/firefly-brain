@@ -30,6 +30,11 @@ uniform vec4  iCurrentCursor;
 uniform vec4  iPreviousCursor;
 uniform vec4  iCurrentCursorColor;
 uniform int   iCursorVisible;
+uniform int   iCurrentCursorStyle;
+#define CURSORSTYLE_BLOCK        0
+#define CURSORSTYLE_BLOCK_HOLLOW 1
+#define CURSORSTYLE_BAR          2
+#define CURSORSTYLE_UNDERLINE    3
 uniform float iTimeCursorChange;
 uniform vec3  iBackgroundColor;
 uniform vec3  iForegroundColor;
