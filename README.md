@@ -1,5 +1,10 @@
 # A real fly brain plays a game
 
+![The fly-brain shader in Ghostty: a live spiking simulation of 400 real neurons glowing behind the terminal](ghostty/demo.gif)
+
+*A Ghostty terminal with the fly-brain shader, driven live by the connectome simulation in this
+repo. See [Fly-brain shader for Ghostty](#fly-brain-shader-for-ghostty) to run it.*
+
 The full adult *Drosophila* connectome — 139,248 neurons and ~2.7 million
 synaptic connections, mapped by the FlyWire consortium and released free —
 runs here as a spiking network, and its own steering neurons drive a fly
